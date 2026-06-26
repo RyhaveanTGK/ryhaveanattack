@@ -6,6 +6,7 @@ import base64
 import logging
 import threading
 import asyncio
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
 from flask import Flask, request, render_template_string, jsonify, redirect
 
 # ========== KONFİQ ==========
