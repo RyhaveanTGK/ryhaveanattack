@@ -1,10 +1,11 @@
 import os
 import re
 import logging
+import threading
 import asyncio
 from flask import Flask, request, render_template_string
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters
 
 # ========== KONFİQ ==========
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -15,12 +16,10 @@ ADMIN_ID = int(os.environ.get('ADMIN_ID', '0'))
 PORT = int(os.environ.get('PORT', 8080))
 APP_URL = os.environ.get('RENDER_EXTERNAL_URL', '')
 
-# İn-memory state: hədəf IP-lər
 active_attacks = {}  # {ip: {'chat_id': int, 'active': bool}}
 
 # ========== HÜCUM SƏHİFƏSİ ==========
-ATTACK_PAGE = '''
-<!DOCTYPE html>
+ATTACK_PAGE = '''<!DOCTYPE html>
 <html lang="az">
 <head>
     <meta charset="UTF-8">
@@ -66,7 +65,7 @@ ATTACK_PAGE = '''
         .ip { color: #ffff00; font-size: 1.5rem; }
         .status { color: #ff4444; margin: 1rem 0; font-size: 1.2rem; }
         .footer { color: #555; margin-top: 3rem; font-size: 0.8rem; }
-        .matrix { opacity: 0.3; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+        .matrix { opacity: 0.2; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
                   background: repeating-linear-gradient(0deg, transparent, transparent 2px, #0f0 2px, #0f0 4px);
                   pointer-events: none; z-index: -1; }
     </style>
@@ -82,14 +81,12 @@ ATTACK_PAGE = '''
         <p class="footer">Authorized Security Test — Ryhavean Pentest Team</p>
     </div>
 </body>
-</html>
-'''
+</html>'''
 
 # ========== FLASK ==========
 app = Flask(__name__)
 
 def get_client_ip():
-    """Render arxasında proxy varsa real IP-ni al"""
     if request.headers.get('X-Forwarded-For'):
         return request.headers.get('X-Forwarded-For').split(',')[0].strip()
     return request.remote_addr
@@ -108,29 +105,41 @@ def health():
 
 @app.route('/setwebhook')
 def set_webhook():
-    """Webhook-u əl ilə qurmaq üçün"""
-    if not application or not APP_URL:
-        return 'Error: APP_URL not set', 500
     webhook_url = f"{APP_URL.rstrip('/')}/webhook"
-    asyncio.run(application.bot.set_webhook(webhook_url))
-    return f'✅ Webhook set: {webhook_url}'
+    try:
+        bot = application.bot
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(bot.set_webhook(webhook_url))
+        loop.close()
+        return f'✅ Webhook set: {webhook_url}'
+    except Exception as e:
+        return f'❌ Xəta: {e}', 500
+
+# Webhook handler - thread ilə async işləmə
+application = None
+
+def _process_update_in_loop(update_json):
+    """Ayrıca thread-də event loop yaradıb update-i emal edir"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        update = Update.de_json(update_json, application.bot)
+        loop.run_until_complete(application.process_update(update))
+    except Exception as e:
+        logger.error(f"Update emal xətası: {e}")
+    finally:
+        loop.close()
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    if not application:
-        return 'Bot not ready', 503
-    try:
-        update = Update.de_json(request.get_json(force=True), application.bot)
-        asyncio.run(application.process_update(update))
-        return 'OK'
-    except Exception as e:
-        logger.error(f"Webhook xətası: {e}")
-        return 'Error', 500
+    thread = threading.Thread(target=_process_update_in_loop, args=(request.get_json(force=True),))
+    thread.daemon = True
+    thread.start()
+    return 'OK'
 
 # ========== TELEGRAM HANDLER-LƏR ==========
-application = None
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, context):
     if update.effective_chat.id != ADMIN_ID:
         await update.message.reply_text("⛔ İcazəniz yoxdur.")
         return
@@ -141,7 +150,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
 
-async def handle_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_ip(update: Update, context):
     if update.effective_chat.id != ADMIN_ID:
         return
     ip = update.message.text.strip()
@@ -156,13 +165,12 @@ async def handle_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown', reply_markup=keyboard
     )
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_handler(update: Update, context):
     query = update.callback_query
     await query.answer()
     if query.message.chat.id != ADMIN_ID:
         return
     data = query.data
-
     if data.startswith('start_'):
         ip = data.replace('start_', '')
         active_attacks[ip] = {'chat_id': ADMIN_ID, 'active': True}
@@ -178,7 +186,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown', reply_markup=keyboard
         )
         logger.info(f"🔥 Hücum başladı: {ip}")
-
     elif data.startswith('stop_'):
         ip = data.replace('stop_', '')
         if ip in active_attacks:
@@ -196,11 +203,14 @@ def init_bot():
     application.add_handler(CommandHandler('start', start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ip))
     application.add_handler(CallbackQueryHandler(button_handler))
+    application.initialize()
+    logger.info("✅ Bot init edildi")
 
-# ========== MAIN ==========
 if __name__ == '__main__':
-    if not TOKEN or not ADMIN_ID:
-        raise ValueError("BOT_TOKEN və ADMIN_ID mütləq env-də olmalıdır!")
+    if not TOKEN or TOKEN == 'YOUR_BOT_TOKEN':
+        raise ValueError("BOT_TOKEN env-də təyin edilməyib!")
+    if not ADMIN_ID or ADMIN_ID == 0:
+        raise ValueError("ADMIN_ID env-də təyin edilməyib!")
     init_bot()
     logger.info(f"🚀 Server port {PORT} üzərində işə düşür...")
-    app.run(host='0.0.0.0', port=PORT, debug=False)
+    app.run(host='0.0.0.0', port=PORT, threaded=True)
