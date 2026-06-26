@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 TOKEN = os.environ.get('BOT_TOKEN')
 ADMIN_ID = int(os.environ.get('ADMIN_ID', '0'))
-PORT = int(os.environ.get('PORT', 10000'))
+PORT = int(os.environ.get('PORT', 10000))
 APP_URL = os.environ.get('RENDER_EXTERNAL_URL', '')
 REDIRECT_TARGET = os.environ.get('REDIRECT_URL', APP_URL)  # Yönlənmə üçün hədəf sayt
 
