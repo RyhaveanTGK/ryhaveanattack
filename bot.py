@@ -3,6 +3,7 @@ import re
 import logging
 import threading
 import asyncio
+import nest_asyncio
 from flask import Flask, request, render_template_string
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters
@@ -13,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 TOKEN = os.environ.get('BOT_TOKEN')
 ADMIN_ID = int(os.environ.get('ADMIN_ID', '0'))
-PORT = int(os.environ.get('PORT', 8080))
+PORT = int(os.environ.get('PORT', 10000))
 APP_URL = os.environ.get('RENDER_EXTERNAL_URL', '')
 
 active_attacks = {}  # {ip: {'chat_id': int, 'active': bool}}
@@ -107,20 +108,18 @@ def health():
 def set_webhook():
     webhook_url = f"{APP_URL.rstrip('/')}/webhook"
     try:
-        bot = application.bot
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(bot.set_webhook(webhook_url))
+        loop.run_until_complete(application.bot.set_webhook(webhook_url))
         loop.close()
         return f'✅ Webhook set: {webhook_url}'
     except Exception as e:
+        logger.error(f"Webhook xətası: {e}")
         return f'❌ Xəta: {e}', 500
 
-# Webhook handler - thread ilə async işləmə
 application = None
 
 def _process_update_in_loop(update_json):
-    """Ayrıca thread-də event loop yaradıb update-i emal edir"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -197,20 +196,50 @@ async def button_handler(update: Update, context):
         )
         logger.info(f"⛔ Hücum dayandı: {ip}")
 
-def init_bot():
+def init_bot_sync():
+    """Synchronous bot initialization"""
     global application
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
     application = Application.builder().token(TOKEN).updater(None).build()
     application.add_handler(CommandHandler('start', start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ip))
     application.add_handler(CallbackQueryHandler(button_handler))
-    application.initialize()
+    
+    # Initialize bot (await the coroutine properly)
+    loop.run_until_complete(application.initialize())
     logger.info("✅ Bot init edildi")
+    loop.close()
+
+# 🔥 BURADA DÜZƏLİŞ: set webhook. Auto-set webhook on startup
+def auto_set_webhook():
+    time.sleep(2)
+    if not APP_URL:
+        logger.warning("⚠️ RENDER_EXTERNAL_URL env-də yoxdur, webhook avtomatik qurulmayacaq")
+        return
+    webhook_url = f"{APP_URL.rstrip('/')}/webhook"
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(application.bot.set_webhook(webhook_url))
+        loop.close()
+        logger.info(f"✅ Webhook avtomatik quruldu: {webhook_url}")
+    except Exception as e:
+        logger.error(f"Webhook qurulma xətası: {e}")
 
 if __name__ == '__main__':
+    import time
+    
     if not TOKEN or TOKEN == 'YOUR_BOT_TOKEN':
         raise ValueError("BOT_TOKEN env-də təyin edilməyib!")
     if not ADMIN_ID or ADMIN_ID == 0:
         raise ValueError("ADMIN_ID env-də təyin edilməyib!")
-    init_bot()
+    
+    init_bot_sync()
+    
+    # Webhook-u avtomatik qur (2 saniyə gecikmə ilə)
+    threading.Thread(target=auto_set_webhook, daemon=True).start()
+    
     logger.info(f"🚀 Server port {PORT} üzərində işə düşür...")
     app.run(host='0.0.0.0', port=PORT, threaded=True)
